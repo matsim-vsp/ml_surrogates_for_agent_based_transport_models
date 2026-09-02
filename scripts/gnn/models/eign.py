@@ -186,8 +186,8 @@ class EIGN(BaseGNN):
         config: object = None,
         loss_fct: nn.Module = None,
         optimizer: optim.Optimizer = None,
-        train_dl: DataLoader = None,
-        valid_dl: DataLoader = None,
+        trainingData_dl: DataLoader = None,
+        validationData_dl: DataLoader = None,
         device: torch.device = None,
         early_stopping: object = None,
         model_save_path: str = None,
@@ -202,7 +202,7 @@ class EIGN(BaseGNN):
             raise ValueError("Config cannot be None")
 
         scaler = GradScaler()
-        total_steps = config.num_epochs * len(train_dl)
+        total_steps = config.num_epochs * len(trainingData_dl)
         scheduler = LinearWarmupCosineDecayScheduler(
             initial_lr=config.lr, total_steps=total_steps
         )
@@ -214,11 +214,11 @@ class EIGN(BaseGNN):
             super().train()
             optimizer.zero_grad()
             for idx, data in tqdm(
-                enumerate(train_dl),
-                total=len(train_dl),
+                enumerate(trainingData_dl),
+                total=len(trainingData_dl),
                 desc=f"Epoch {epoch+1}/{config.num_epochs}",
             ):
-                step = epoch * len(train_dl) + idx
+                step = epoch * len(trainingData_dl) + idx
                 lr = scheduler.get_lr(step)
                 for param_group in optimizer.param_groups:
                     param_group["lr"] = lr
@@ -309,7 +309,7 @@ class EIGN(BaseGNN):
                             }
                         )
 
-            if len(train_dl) % config.gradient_accumulation_steps != 0:
+            if len(trainingData_dl) % config.gradient_accumulation_steps != 0:
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
@@ -324,7 +324,7 @@ class EIGN(BaseGNN):
                     validate_model_during_training_eign(
                         config=config,
                         model=self,
-                        dataset=valid_dl,
+                        dataset=validationData_dl,
                         loss_func=loss_fct,
                         device=device,
                         scalers_validation=scalers_validation,

@@ -11,15 +11,20 @@ import torch.optim as optim
 from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 
-# Add the 'scripts' directory to Python Path
+# Add the 'scripts' directory to Python Path (project root access for imports)
 scripts_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 if scripts_path not in sys.path:
     sys.path.append(scripts_path)
 
+# Project-specific helper functions
 from gnn.help_functions import validate_model_during_training, LinearWarmupCosineDecayScheduler
 
+
 class BaseGNN(nn.Module, ABC):
-    def __init__(self, 
+    # (nn comes from torch.nn, see import statement above.  nn.Module = "base class for all neural network modules".)
+    # (ABC is the python way to program abstract classes; in some sense we obtain from ABC the missing functionality.)
+
+    def __init__(self,
                  in_channels: int,
                  out_channels: int,
                  dropout: float = 0.3,
@@ -29,229 +34,281 @@ class BaseGNN(nn.Module, ABC):
                  log_to_wandb: bool = False):
         """
         Base class for all GNN implementations.
-        Core parameters are defined here, additional parameters can be added in child classes.
-        
-        Child classes must call super().__init__() in their __init__ method. Followed by self.define_layers() and self.initialize_weights().
-        See the PointNetTransfGAT class for an example.
+        Defines shared hyperparameters and interface.
         """
         super().__init__()
+
+        # Model dimensions
         self.in_channels = in_channels
         self.out_channels = out_channels
+
+        # Regularization
         self.dropout = dropout
         self.use_dropout = use_dropout
+
+        # Multi-task / auxiliary prediction flag
         self.predict_mode_stats = predict_mode_stats
+
+        # Numerical precision
         self.dtype = dtype
-        
-        # Log specific model kwargs to wandb (during training runs)
+
+        # Logging configuration
         self.log_to_wandb = log_to_wandb
-        
+
     @abstractmethod
     def define_layers(self):
         """
-        Define layers of the model. Must be implemented by all child classes.
+        Must be implemented in subclass:
+        defines neural network architecture.
         """
         pass
-            
+
     @abstractmethod
     def forward(self, data):
         """
-        Forward pass of the model.
-        Must be implemented by all child classes.
+        Must be implemented in subclass:
+        forward pass of the model.
         """
         pass
 
     def initialize_weights(self):
         """
-        Initialize model weights. Can be overridden by child classes.
-        Call super().initialize_weights() to apply this base logic.
+        Default weight initialization for Linear layers.
+        Can be overridden in subclasses.
         """
         for m in self.modules():
             if isinstance(m, nn.Linear):
+                # Kaiming initialization (good for ReLU-like activations)
                 nn.init.kaiming_normal_(m.weight)
                 nn.init.zeros_(m.bias)
 
-    def train_model(self, 
-            config: object = None, 
-            loss_fct: nn.Module = None, 
-            optimizer: optim.Optimizer = None, 
-            train_dl: DataLoader = None, 
-            valid_dl: DataLoader = None, 
-            device: torch.device = None, 
-            early_stopping: object = None, 
-            model_save_path: str = None,
-            scalers_train: dict = None,
-            scalers_validation: dict = None) -> tuple:
+    def train_model(self,
+                    config: object = None,
+                    loss_fct: nn.Module = None,
+                    optimizer: optim.Optimizer = None,
+                    trainingData_dl: DataLoader = None,
+                    validationData_dl: DataLoader = None,
+                    device: torch.device = None,
+                    early_stopping: object = None,
+                    model_save_path: str = None,
+                    scalers_train: dict = None,
+                    scalers_validation: dict = None) -> tuple:
         """
-        Basic training pipeline for GNN models, can be overridden by child classes.
-
-        Parameters:
-        - model (nn.Module): The model to train.
-        - config (object, optional): Configuration object containing training parameters.
-        - loss_fct (nn.Module, optional): Loss function for training.
-        - optimizer (optim.Optimizer, optional): Optimizer for model training.
-        - train_dl (DataLoader, optional): DataLoader for training data.
-        - valid_dl (DataLoader, optional): DataLoader for validation data.
-        - device (torch.device, optional): Device to use for training.
-        - early_stopping (object, optional): Early stopping mechanism.
-        - model_save_path (str, optional): Path to save the best model.
-        - scalers_train (dict, optional): x and pos scalers for training data.
-        - scalers_validation (dict, optional): x and pos scalers for validation data.
-
-        Returns:
-        - tuple: Validation loss and the best epoch.
+        Full training loop for GNN models.
+        Includes training, validation, logging, checkpointing, and early stopping.
         """
+
+        # Safety check: config is mandatory
         if config is None:
             raise ValueError("Config cannot be None")
-        
+
+        # Mixed precision gradient scaler (stabilizes FP16 training)
         scaler = GradScaler()
-        total_steps = config.num_epochs * len(train_dl)
-        scheduler = LinearWarmupCosineDecayScheduler(initial_lr=config.lr, total_steps=total_steps)
+
+        # Total number of optimization steps (for LR scheduler)
+        total_steps = config.num_epochs * len(trainingData_dl)
+
+        # Learning rate scheduler (warmup + cosine decay)
+        scheduler = LinearWarmupCosineDecayScheduler(
+            initial_lr=config.lr,
+            total_steps=total_steps
+        )
+
+        # Track best validation loss
         best_val_loss = float('inf')
+
+        # Directory for checkpoints
         checkpoint_dir = os.path.join(os.path.dirname(model_save_path), "checkpoints")
         os.makedirs(checkpoint_dir, exist_ok=True)
 
-        # TODO: Maybe add as a parameter later?
-        # Separate loss for mode stats
+        # Auxiliary loss for multi-task setup
         mode_stats_loss = nn.MSELoss().to(dtype=torch.float32).to(device)
 
-        # Define WandB Logging Metrics
+        # Setup logging metrics for wandb
         from training.help_functions import setup_wandb_metrics
         setup_wandb_metrics(predict_mode_stats=config.predict_mode_stats)
 
+        # -----------------------
+        # Resume training logic
+        # -----------------------
         if config.continue_training:
 
-            # Load checkpoint
             checkpoint = torch.load(config.base_checkpoint_path)
-            
+
+            # Restore model + optimizer + scaler state
             self.load_state_dict(checkpoint['model_state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+
             if 'scaler_state_dict' in checkpoint:
                 scaler.load_state_dict(checkpoint['scaler_state_dict'])
-            
+
             best_val_loss = checkpoint['best_val_loss']
             start_epoch = checkpoint['epoch'] + 1
-            
-            print(f"Resuming training from epoch {start_epoch} with best validation loss: {best_val_loss}")
 
-        for epoch in range(start_epoch if config.continue_training else 0, config.num_epochs):
-            super().train()
+            print(f"Resuming training from epoch {start_epoch} with best validation loss: {best_val_loss}")
+        else:
+            start_epoch = 0
+
+        # =======================
+        # Training loop (epochs)
+        # =======================
+        for epoch in range(start_epoch, config.num_epochs):
+
+            self.train()  # set dropout/batchnorm to training mode
+
             optimizer.zero_grad()
 
-            # Total loss
+            # Accumulators for epoch-level statistics
             epoch_train_loss = 0
             epoch_train_loss_node_predictions = 0
             epoch_train_loss_mode_stats = 0
 
-            for idx, data in tqdm(enumerate(train_dl), total=len(train_dl), desc=f"Epoch {epoch+1}/{config.num_epochs}"):
-                step = epoch * len(train_dl) + idx
+            # =======================
+            # Training loop (batches)
+            # =======================
+            for idx, data in tqdm(enumerate(trainingData_dl), total=len(trainingData_dl),
+                                  desc=f"Epoch {epoch+1}/{config.num_epochs}"):
+
+                # global training step index
+                step = epoch * len(trainingData_dl) + idx
+
+                # update learning rate per step
                 lr = scheduler.get_lr(step)
                 for param_group in optimizer.param_groups:
                     param_group['lr'] = lr
-                    
-                data = data.to(device)
-                targets_node_predictions = data.y
-                x_unscaled = scalers_train["x_scaler"].inverse_transform(data.x.detach().clone().cpu().numpy())
 
+                # move batch to GPU/CPU device
+                data = data.to(device)
+
+                # target for node-level prediction task
+                targets_node_predictions = data.y
+
+                # inverse transform features for custom loss computations
+                x_unscaled = scalers_train["x_scaler"].inverse_transform(
+                    data.x.detach().clone().cpu().numpy()
+                )
+
+                # optional auxiliary target
                 if config.predict_mode_stats:
                     targets_mode_stats = data.mode_stats
-            
+
+                # mixed precision forward pass
                 with autocast():
-                    # Forward pass
+                    # (autocast is a cuda function)
+
                     if config.predict_mode_stats:
+                        # multi-output model
                         predicted, mode_stats_pred = self(data)
-                        train_loss_node_predictions = loss_fct(predicted, targets_node_predictions, x_unscaled)
-                        train_loss_mode_stats = mode_stats_loss(mode_stats_pred, targets_mode_stats)
+
+                        # main loss
+                        train_loss_node_predictions = loss_fct(
+                            predicted,
+                            targets_node_predictions,
+                            x_unscaled
+                        )
+
+                        # auxiliary loss
+                        train_loss_mode_stats = mode_stats_loss(
+                            mode_stats_pred,
+                            targets_mode_stats
+                        )
+
                         train_loss = train_loss_node_predictions + train_loss_mode_stats
+
                     else:
                         predicted = self(data)
                         train_loss = loss_fct(predicted, targets_node_predictions, x_unscaled)
 
-                # Total loss
+                # accumulate loss stats
                 epoch_train_loss += train_loss.item()
+
                 if config.predict_mode_stats:
                     epoch_train_loss_node_predictions += train_loss_node_predictions.item()
                     epoch_train_loss_mode_stats += train_loss_mode_stats.item()
-        
-                # Backward pass
-                scaler.scale(train_loss).backward() 
-                
-                # Gradient clipping
+
+                # backward pass with gradient scaling (FP16 stability)
+                scaler.scale(train_loss).backward()
+
+                # optional gradient clipping
                 if config.use_gradient_clipping:
                     torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
 
+                # gradient accumulation step
                 if (idx + 1) % config.gradient_accumulation_steps == 0:
                     scaler.step(optimizer)
                     scaler.update()
                     optimizer.zero_grad()
-                    
-                # Batch level logging
+
+                # batch-level logging to wandb
                 if config.predict_mode_stats:
-                    wandb.log({"batch_train_loss": train_loss.item(),
-                               "batch_train_loss-node_predictions": train_loss_node_predictions.item(),
-                               "batch_train_loss-mode_stats": train_loss_mode_stats.item(),
-                               "batch_step":step})
-                else:   
-                    wandb.log({"batch_train_loss": train_loss.item(),
-                               "batch_step":step})
-            
-            if len(train_dl) % config.gradient_accumulation_steps != 0:
+                    wandb.log({
+                        "batch_train_loss": train_loss.item(),
+                        "batch_train_loss-node_predictions": train_loss_node_predictions.item(),
+                        "batch_train_loss-mode_stats": train_loss_mode_stats.item(),
+                        "batch_step": step
+                    })
+                else:
+                    wandb.log({
+                        "batch_train_loss": train_loss.item(),
+                        "batch_step": step
+                    })
+
+            # flush remaining gradients if accumulation not aligned
+            if len(trainingData_dl) % config.gradient_accumulation_steps != 0:
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
-                
-            # Validation step
+
+            # -----------------------
+            # Validation phase
+            # -----------------------
             if config.predict_mode_stats:
-                val_loss, r_squared, spearman_corr, pearson_corr, val_loss_node_predictions, val_loss_mode_stats = validate_model_during_training(
+
+                val_loss, r_squared, spearman_corr, pearson_corr, \
+                    val_loss_node_predictions, val_loss_mode_stats = validate_model_during_training(
                     config=config,
                     model=self,
-                    dataset=valid_dl,
+                    dataset=validationData_dl,
                     loss_func=loss_fct,
                     device=device,
                     scalers_validation=scalers_validation
                 )
-                # Epoch level logging
-                wandb.log({
-                    "val_loss": val_loss,
-                    "train_loss": epoch_train_loss / len(train_dl),
-                    "lr": lr,
-                    "r^2": r_squared,
-                    "spearman": spearman_corr,
-                    "pearson": pearson_corr,
-                    "train_loss-node_predictions": epoch_train_loss_node_predictions / len(train_dl),
-                    "train_loss-mode_stats": epoch_train_loss_mode_stats / len(train_dl),
-                    "val_loss-node_predictions": val_loss_node_predictions,
-                    "val_loss-mode_stats": val_loss_mode_stats,
-                    "epoch":epoch})
+
             else:
+
                 val_loss, r_squared, spearman_corr, pearson_corr = validate_model_during_training(
                     config=config,
                     model=self,
-                    dataset=valid_dl,
+                    dataset=validationData_dl,
                     loss_func=loss_fct,
                     device=device,
                     scalers_validation=scalers_validation
                 )
-                # Epoch level logging
-                wandb.log({
-                    "val_loss": val_loss,
-                    "train_loss": epoch_train_loss / len(train_dl),
-                    "lr": lr,
-                    "r^2": r_squared,
-                    "spearman": spearman_corr,
-                    "pearson": pearson_corr,
-                    "epoch":epoch})
+
+            # epoch-level logging
+            wandb.log({
+                "val_loss": val_loss,
+                "train_loss": epoch_train_loss / len(trainingData_dl),
+                "lr": lr,
+                "r^2": r_squared,
+                "spearman": spearman_corr,
+                "pearson": pearson_corr,
+                "epoch": epoch
+            })
 
             print(f"epoch: {epoch}, validation loss: {val_loss}, lr: {lr}, r^2: {r_squared}")
-            
+
+            # save best model
             if val_loss < best_val_loss:
-                best_val_loss = val_loss   
-                if model_save_path:         
+                best_val_loss = val_loss
+                if model_save_path:
                     torch.save(self.state_dict(), model_save_path)
-                    print(f'Best model saved to {model_save_path} with validation loss: {val_loss}')
-            
-            # Save checkpoint
+                    print(f"Best model saved to {model_save_path}")
+
+            # periodic checkpointing
             if epoch % 20 == 0:
                 checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_epoch_{epoch}.pt")
+
                 torch.save({
                     'epoch': epoch,
                     'model_state_dict': self.state_dict(),
@@ -260,14 +317,19 @@ class BaseGNN(nn.Module, ABC):
                     'best_val_loss': best_val_loss,
                     'val_loss': val_loss,
                 }, checkpoint_path)
-                print(f'Checkpoint saved to {checkpoint_path}')
-            
+
+                print(f"Checkpoint saved: {checkpoint_path}")
+
+            # early stopping check
             early_stopping(val_loss)
+
             if early_stopping.early_stop:
-                print("Early stopping triggered. Stopping training.")
+                print("Early stopping triggered.")
                 break
-        
+
+        # final summary
         print("Best validation loss: ", best_val_loss)
         wandb.summary["best_val_loss"] = best_val_loss
         wandb.finish()
+
         return val_loss, epoch

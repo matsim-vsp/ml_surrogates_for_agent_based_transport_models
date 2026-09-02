@@ -107,17 +107,17 @@ class XGBoostModel(BaseGNN):
         # Convert back to torch tensor
         return torch.tensor(predictions, dtype=self.dtype)
 
-    def train_model(self, 
-            config: object = None, # Unused, but kept for compatibility
-            loss_fct: object = None, # Unused, but kept for compatibility
-            optimizer: object = None, # Unused, but kept for compatibility
-            train_dl: object = None, 
-            valid_dl: object = None, 
-            device: torch.device = None, # Unused, but kept for compatibility
-            early_stopping: object = None, # Unused, but kept for compatibility
-            model_save_path: str = None,
-            scalers_train: dict = None, # Unused, but kept for compatibility
-            scalers_validation: dict = None) -> tuple: # Unused, but kept for compatibility
+    def train_model(self,
+                    config: object = None,  # Unused, but kept for compatibility
+                    loss_fct: object = None,  # Unused, but kept for compatibility
+                    optimizer: object = None,  # Unused, but kept for compatibility
+                    trainingData_dl: object = None,
+                    validationData_dl: object = None,
+                    device: torch.device = None,  # Unused, but kept for compatibility
+                    early_stopping: object = None,  # Unused, but kept for compatibility
+                    model_save_path: str = None,
+                    scalers_train: dict = None,  # Unused, but kept for compatibility
+                    scalers_validation: dict = None) -> tuple: # Unused, but kept for compatibility
         """
         Custom training method for XGBoost that converts PyTorch data to XGBoost format.
         """
@@ -126,7 +126,7 @@ class XGBoostModel(BaseGNN):
         X_train = []
         y_train = []
         
-        for data in train_dl:
+        for data in trainingData_dl:
             # Process features
             if isinstance(data, Batch):
                 datalist = data.to_data_list()
@@ -154,7 +154,7 @@ class XGBoostModel(BaseGNN):
         X_valid = []
         y_valid = []
         
-        for data in valid_dl:
+        for data in validationData_dl:
             if isinstance(data, Batch):
                 datalist = data.to_data_list()
             else:
